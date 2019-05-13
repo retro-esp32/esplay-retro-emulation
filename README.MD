@@ -27,3 +27,11 @@ ROM
 --- 
 Extract skeleton.zip from docs, and copy to the root of sdcard. Please provide ROM by yourself and place them in the appropriate folder on sdcard.
 
+All Contributors
+------------
+Thanks to contribute your work for this project. 
+- [32teeth]
+
+
+[32teeth]:https://github.com/32teeth
+
