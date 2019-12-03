@@ -16,7 +16,7 @@
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
 #include <dirent.h>
-
+#include <limits.h>
 
 #include "settings.h"
 #include "power.h"
@@ -44,16 +44,18 @@ int app_main(void)
 {
     printf("nesemu (%s-%s).\n", COMPILEDATE, GITREV);
 
-    nvs_flash_init();
+    settings_init();
 
-    system_init();
+    esplay_system_init();
 
     esp_err_t ret;
 
+    audio_init(32000);
 
     char* fileName;
 
-    char* romName = get_rom_name_settings();
+    char *romName = settings_load_str(SettingRomPath);
+
     if (romName)
     {
         fileName = system_util_GetFileName(romName);
@@ -70,18 +72,20 @@ int app_main(void)
     int startHeap = esp_get_free_heap_size();
     printf("A HEAP:0x%x\n", startHeap);
 
-
-    display_init();
-
     // Joystick.
     gamepad_init();
 
+    // display
+    display_init();
     display_prepare();
 
-    set_display_brightness(get_backlight_settings());
+    // display brightness
+    int brightness;
+    settings_load(SettingBacklight, &brightness);
+    set_display_brightness(brightness);
 
-    //display_show_splash();
-    //vTaskDelay(1000);
+    // battery
+    battery_level_init();
 
     switch (esp_sleep_get_wakeup_cause())
     {
@@ -127,7 +131,7 @@ int app_main(void)
     }
 
     // Load ROM
-    char* romPath = get_rom_name_settings();
+    char *romPath = settings_load_str(SettingRomPath);
     if (!romPath)
     {
         printf("osd_getromdata: Reading from flash.\n");

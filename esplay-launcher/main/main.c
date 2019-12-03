@@ -1,331 +1,171 @@
 // Esplay Launcher - launcher for ESPLAY based on Gogo Launcher for Odroid Go.
-
+#include "limits.h" /* PATH_MAX */
 #include "freertos/FreeRTOS.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "esp_event.h"
 #include "esp_event_loop.h"
-#include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "esp_partition.h"
 #include "esp_ota_ops.h"
 #include "esp_heap_caps.h"
+#include "esp_http_server.h"
+#include "soc/dport_reg.h"
+
+#include "rom/rtc.h"
+#include "soc/soc.h"
+#include "soc/rtc.h"
+#include "soc/rtc_cntl_reg.h"
 
 #include "settings.h"
 #include "gamepad.h"
+#include "event.h"
 #include "display.h"
 #include "audio.h"
 #include "power.h"
 #include "sdcard.h"
+#include "esplay-ui.h"
+#include "ugui.h"
+#include "graphics.h"
+#include "audio_player.h"
+#include "file_ops.h"
 
-#include "font.h"
-#include "volume.h"
-#include "brightness.h"
-#include "gameboy.h"
-#include "nintendo.h"
-#include "gameboy_color.h"
-#include "gg.h"
-#include "colecovision.h"
-#include "main_title.h"
-#include "sms.h"
-#include "scale_option.h"
+#define SCROLLSPD 64
+#define NUM_EMULATOR 7
+#define AUDIO_FILE_PATH "/sd/audio"
 
-#include <string.h>
-#include <dirent.h>
-
-input_gamepad_state joystick;
-
+char emu_dir[6][10] = {"nes", "gb", "gbc", "sms", "gg", "col"};
+char emu_name[6][20] = {"Nintendo", "Gameboy", "Gameboy Color", "Sega Master System", "Game Gear", "Coleco Vision"};
+int emu_slot[6] = {1, 2, 2, 3, 3, 3};
+char *base_path = "/sd/roms/";
 battery_state bat_state;
+int num_menu = 5;
+char menu_text[5][20] = {"WiFi AP *", "Volume", "Brightness", "Upscaler", "Quit"};
+char scaling_text[3][20] = {"Native", "Normal", "Stretch"};
+int32_t wifi_en = 0;
+int32_t volume = 25;
+int32_t bright = 50;
+int32_t scaling = SCALE_FIT;
 
-int BatteryPercent = 100;
 
-unsigned short buffer[40000];
-int colour = 65535; // white text mostly.
+esp_err_t start_file_server(const char *base_path);
 
-int num_emulators = 9;
-char emulator[10][32] = {"Nintendo", "GAMEBOY", "GAMEBOY COLOR", "SEGA MASTER SYSTEM", "GAME GEAR", "COLECO VISION", "Sound Volume", "Display Brightness", "Display Scale Options"};
-char emu_dir[10][20] = {"nes", "gb", "gbc", "sms", "gg", "col"};
-int emu_slot[10] = {1, 2, 2, 3, 3, 3};
-char brightness[10][5] = {"10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"};
-char volume[10][10] = {"Mute", "25%", "50%", "75%", "100%"};
-char scale_options[10][20] = {"Disable", "Screen Fit", "Stretch"};
-
-char target[256] = "";
-int e = 0, last_e = 100, x, y = 0, count = 0;
-
-//----------------------------------------------------------------
-int read_config()
+esp_err_t event_handler(void *ctx, system_event_t *event)
 {
-    FILE *fp;
-    int v;
-
-    if ((fp = fopen("/sd/esplay/data/gogo_conf.txt", "r")))
-    {
-        while (!feof(fp))
-        {
-            fscanf(fp, "%s %s %i\n", &emulator[num_emulators][0],
-                   &emu_dir[num_emulators][0],
-                   &emu_slot[num_emulators]);
-            num_emulators++;
-        }
-    }
-
-    return (0);
+    return ESP_OK;
 }
 
-//----------------------------------------------------------------
-void debounce(int key)
-{
-    while (joystick.values[key])
-        gamepad_read(&joystick);
+static void handleCharging() {
+	int r;
+	int fullCtr=0;
+	//The LiIon charger sometimes goes back from 'full' to 'charging', which is
+	//confusing to the end user. This variable becomes true if the LiIon has indicated 'full'
+	//for a while, and it being true causes the 'full' icon to always show.
+	int fixFull=0;
+
+	//Force brightness low to decrease chance of burn-in
+	set_display_brightness(30);
+	printf("Detected charger.\n");
+	guiCharging(0);
+
+	//Speed down
+	rtc_clk_cpu_freq_set(RTC_CPU_FREQ_80M);
+    input_gamepad_state prevKey;
+    gamepad_read(&prevKey);
+	do {
+        input_gamepad_state key;
+        gamepad_read(&key);
+		r=getChargeStatus();
+		if (r==FULL_CHARGED || fixFull) {
+			guiFull();
+			printf("Full!\n");
+			fullCtr++;
+		} else if (r==CHARGING) {
+            battery_level_read(&bat_state);
+			guiCharging(bat_state.millivolts > 4100);
+			printf("Charging...\n");
+			fullCtr=0;
+		}
+
+		if (!prevKey.values[GAMEPAD_INPUT_A] && key.values[GAMEPAD_INPUT_A]) {
+			printf("Power btn A; go to launcher menu\n");
+			break;
+		}
+		if (fullCtr==32) {
+			fixFull=1;
+		}
+		vTaskDelay(1);
+        prevKey = key;
+	} while (r!=NO_CHRG);
+
+    rtc_clk_cpu_freq_set(RTC_CPU_FREQ_240M);
 }
 
-//----------------------------------------------------------------
-// print a character string to screen...
-void print(short x, short y, char *s)
+static void drawHomeScreen()
 {
-    int i, n, k, a, len, idx;
-    unsigned char c;
-    //extern unsigned short  *buffer; // screen buffer, 16 bit pixels
+    ui_clear_screen();
+    UG_SetForecolor(C_YELLOW);
+    UG_SetBackcolor(C_BLACK);
+    char *title = "ESPlay Micro";
+    UG_PutString((320 / 2) - (strlen(title) * 9 / 2), 12, title);
 
-    len = strlen(s);
-    for (k = 0; k < len; k++)
+    if (wifi_en)
     {
-        c = s[k];
-        for (i = 0; i < 8; i++)
-        {
-            a = font_8x8[c][i];
-            for (n = 7, idx = i * len * 8 + k * 8; n >= 0; n--, idx++)
-            {
-                if (a % 2 == 1)
-                    buffer[idx] = colour;
-                else
-                    buffer[idx] = 0;
-                a = a >> 1;
-            }
-        }
+        title = "Wifi ON, go to http://192.168.4.1/";
+        UG_PutString((320 / 2) - (strlen(title) * 9 / 2), 32, title);
     }
-    write_frame_rectangleLE(x * 8, y * 8, len * 8, 8, buffer);
+
+    UG_SetForecolor(C_WHITE);
+    UG_SetBackcolor(C_BLACK);
+    UG_PutString(40, 50 + (56 * 2) + 13, "    Browse");
+    UG_PutString(40, 50 + (56 * 2) + 13 + 18, "  Select");
+    UG_PutString(160, 50 + (56 * 2) + 13, "  Resume");
+    UG_PutString(160, 50 + (56 * 2) + 13 + 18, "     Options");
+
+    UG_SetForecolor(C_BLACK);
+    UG_SetBackcolor(C_WHITE);
+    UG_FillRoundFrame(35, 50 + (56 * 2) + 13 - 1, 48 + (2 * 9) + 3, 50 + (56 * 2) + 13 + 11, 7, C_WHITE);
+    UG_PutString(40, 50 + (56 * 2) + 13, "< >");
+
+    UG_FillCircle(43, 50 + (56 * 2) + 13 + 18 + 5, 7, C_WHITE);
+    UG_PutString(40, 50 + (56 * 2) + 13 + 18, "A");
+
+    UG_FillCircle(163, 50 + (56 * 2) + 13 + 5, 7, C_WHITE);
+    UG_PutString(160, 50 + (56 * 2) + 13, "B");
+
+    UG_FillRoundFrame(155, 50 + (56 * 2) + 13 + 18 - 1, 168 + (3 * 9) + 3, 50 + (56 * 2) + 13 + 18 + 11, 7, C_WHITE);
+    UG_PutString(160, 50 + (56 * 2) + 13 + 18, "MENU");
+
+    uint8_t volume = 25;
+    settings_load(SettingAudioVolume, &volume);
+    char volStr[3];
+    sprintf(volStr, "%i", volume);
+    if (volume == 0)
+    {
+        UG_SetForecolor(C_RED);
+        UG_SetBackcolor(C_BLACK);
+    }
+    else
+    {
+        UG_SetForecolor(C_WHITE);
+        UG_SetBackcolor(C_BLACK);
+    }
+    UG_PutString(25, 12, volStr);
+    battery_level_read(&bat_state);
+    drawVolume(volume);
+    drawBattery(bat_state.percentage);
+    if (wifi_en)
+        renderGraphics(320 - (50), 0, 24 * 7, 0, 24, 24);
 }
 
-//--------------------------------------------------------------
-void print_y(short x, short y, char *s) // print, but yellow text...
-{
-    colour = 0b1111111111100000;
-    print(x, y, s);
-    colour = 65535;
-}
-
-//-------------------------------------------------------------
-// display details for a particular emulator....
-int print_emulator(int e, int y)
-{
-    int i, x, len, dotlen;
-    DIR *dr;
-    struct dirent *de;
-    char path[256] = "/sd/roms/";
-    char s[40];
-
-    if (e != last_e)
-    {
-        for (i = 0; i < 320 * 56; i++)
-            buffer[i] = 65535;
-        write_frame_rectangleLE(0, 50, 320, 56, buffer);
-
-        switch (e)
-        {
-        case 0:
-            write_frame_rectangleLE(85, 50, 150, 56, nintendo_icon.pixel_data);
-            break;
-        case 1:
-            write_frame_rectangleLE(85, 50, 150, 56, gameboy_icon.pixel_data);
-            break;
-        case 2:
-            write_frame_rectangleLE(85, 50, 150, 56, gameboy_color_icon.pixel_data);
-            break;
-        case 3:
-            write_frame_rectangleLE(85, 50, 150, 56, sms_icon.pixel_data);
-            break;
-        case 4:
-            write_frame_rectangleLE(85, 50, 150, 56, gg_icon.pixel_data);
-            break;
-        case 5:
-            write_frame_rectangleLE(85, 50, 150, 56, colecovision_icon.pixel_data);
-            break;
-        case 6:
-            write_frame_rectangleLE(85, 50, 150, 56, volume_icon.pixel_data);
-            break;
-        case 7:
-            write_frame_rectangleLE(85, 50, 150, 56, brightness_icon.pixel_data);
-            break;        
-        case 8:
-            write_frame_rectangleLE(85, 50, 150, 56, scale_option_icon.pixel_data);
-            break;
-        }
-
-        last_e = e;
-    }
-
-    if (e < 6)
-    {
-        for (i = 0; i < 40; i++)
-            s[i] = ' ';
-        s[i] = 0;
-        len = strlen(emulator[e]);
-        for (i = 0; i < len; i++)
-            s[i + 19 - len / 2] = emulator[e][i];
-        print(0, 18, s);
-
-        strcat(&path[strlen(path) - 1], emu_dir[e]);
-        count = 0;
-        for (i = 0; i < 40; i++)
-            s[i] = ' ';
-        s[i] = 0;
-        if (!(dr = opendir(path)))
-        {
-            for (i = 20; i < 30; i++)
-                print(0, i, s);
-            return (0);
-        }
-
-        while ((de = readdir(dr)) != NULL)
-        {
-
-            len = strlen(de->d_name);
-            dotlen = strlen(emu_dir[e]);
-            // only show files that have matching extension...
-            if (strcmp(&de->d_name[len - dotlen], emu_dir[e]) == 0 && de->d_name[0] != '.')
-            {
-                printf("file: %s\n", de->d_name);
-                if (count == y)
-                {
-                    strcpy(target, path);
-                    i = strlen(target);
-                    target[i] = '/';
-                    target[i + 1] = 0;
-                    strcat(target, de->d_name);
-                    printf("target=%s\n", target);
-                }
-                // strip extension from file...
-                de->d_name[len - dotlen - 1] = 0;
-                if (strlen(de->d_name) > 39)
-                    de->d_name[39] = 0;
-                if (y / 10 == count / 10)
-                { // right page?
-                    for (i = 0; i < 40; i++)
-                        s[i] = ' ';
-                    for (i = 0; i < strlen(de->d_name); i++)
-                        s[i] = de->d_name[i];
-                    if (count == y)
-                        print_y(0, (count % 10) + 20, s); // highlight
-                    else
-                        print(0, (count % 10) + 20, s);
-                }
-                count++;
-            }
-        }
-        if (y / 10 == count / 10)
-            for (i = count % 10; i < 10; i++)
-                print(0, i + 20, "                                        ");
-        closedir(dr);
-        printf("total=%i\n", count);
-    }
-    else if (e == 6)
-    {
-        for (i = 0; i < 40; i++)
-            s[i] = ' ';
-        s[i] = 0;
-        len = strlen(emulator[e]);
-        for (i = 0; i < len; i++)
-            s[i + 19 - len / 2] = emulator[e][i];
-        print(0, 18, s);
-
-        count = 0;
-        while (count < 5)
-        {
-            for (i = 0; i < 40; i++)
-                s[i] = ' ';
-            for (i = 0; i < strlen(volume[count]); i++)
-                s[i] = volume[count][i];
-            if (count == y)
-                print_y(0, (count % 10) + 20, s); // highlight
-            else
-                print(0, (count % 10) + 20, s);
-            count++;
-        }
-        if (y / 10 == count / 10)
-            for (i = count % 10; i < 10; i++)
-                print(0, i + 20, "                                        ");
-    }
-    else if (e == 7)
-    {
-        for (i = 0; i < 40; i++)
-            s[i] = ' ';
-        s[i] = 0;
-        len = strlen(emulator[e]);
-        for (i = 0; i < len; i++)
-            s[i + 19 - len / 2] = emulator[e][i];
-        print(0, 18, s);
-
-        count = 0;
-        while (count < 10)
-        {
-            for (i = 0; i < 40; i++)
-                s[i] = ' ';
-            for (i = 0; i < strlen(brightness[count]); i++)
-                s[i] = brightness[count][i];
-            if (count == y)
-                print_y(0, (count % 10) + 20, s); // highlight
-            else
-                print(0, (count % 10) + 20, s);
-            count++;
-        }
-        if (y / 10 == count / 10)
-            for (i = count % 10; i < 10; i++)
-                print(0, i + 20, "                                        ");
-    }
-
-    else if (e == 8)
-    {
-        for (i = 0; i < 40; i++)
-            s[i] = ' ';
-        s[i] = 0;
-        len = strlen(emulator[e]);
-        for (i = 0; i < len; i++)
-            s[i + 19 - len / 2] = emulator[e][i];
-        print(0, 18, s);
-
-        count = 0;
-        while (count < 10)
-        {
-            for (i = 0; i < 40; i++)
-                s[i] = ' ';
-            for (i = 0; i < strlen(scale_options[count]); i++)
-                s[i] = scale_options[count][i];
-            if (count == y)
-                print_y(0, (count % 10) + 20, s); // highlight
-            else
-                print(0, (count % 10) + 20, s);
-            count++;
-        }
-        if (y / 10 == count / 10)
-            for (i = count % 10; i < 10; i++)
-                print(0, i + 20, "                                        ");
-    }
-
-    return (0);
-}
-
-//----------------------------------------------------------------
 // Return to last emulator if 'B' pressed....
-int resume(void)
+static int resume(void)
 {
     int i;
     char *extension;
-    char *romPath;
+    char *romPath = settings_load_str(SettingRomPath);
 
     printf("trying to resume...\n");
-    romPath = get_rom_name_settings();
     if (romPath)
     {
         extension = system_util_GetFileExtenstion(romPath);
@@ -338,14 +178,15 @@ int resume(void)
         printf("can't resume!\n");
         return (0);
     }
-    for (i = 0; i < num_emulators; i++)
+    for (i = 0; i < NUM_EMULATOR; i++)
     {
         if (strcmp(extension, &emu_dir[i][0]) == 0)
         {
             printf("resume - extension=%s, slot=%i\n", extension, i);
             system_application_set(emu_slot[i]); // set emulator slot
-            print(14, 15, "RESUMING....");
-            usleep(500000);
+            ui_clear_screen();
+            ui_flush();
+            display_show_hourglass();
             esp_restart(); // reboot!
         }
     }
@@ -355,66 +196,224 @@ int resume(void)
     return (0); // nope!
 }
 
+static void showOptionPage(int selected)
+{
+    ui_clear_screen();
+    /* Header */
+    UG_FillFrame(0, 0, 320 - 1, 16 - 1, C_BLUE);
+    UG_SetForecolor(C_WHITE);
+    UG_SetBackcolor(C_BLUE);
+    char *msg = "Device Options";
+    UG_PutString((320 / 2) - (strlen(msg) * 9 / 2), 2, msg);
+    /* End Header */
+
+    /* Footer */
+    UG_FillFrame(0, 240 - 16 - 1, 320 - 1, 240 - 1, C_BLUE);
+    UG_SetForecolor(C_WHITE);
+    UG_SetBackcolor(C_BLUE);
+    msg = "     Browse      Change       ";
+    UG_PutString((320 / 2) - (strlen(msg) * 9 / 2), 240 - 15, msg);
+
+    UG_FillRoundFrame(15, 240 - 15 - 1, 15 + (5 * 9) + 8, 237, 7, C_WHITE);
+    UG_SetForecolor(C_BLACK);
+    UG_SetBackcolor(C_WHITE);
+    UG_PutString(20, 240 - 15, "Up/Dn");
+
+    UG_FillRoundFrame(140, 240 - 15 - 1, 140 + (3 * 9) + 8, 237, 7, C_WHITE);
+    UG_PutString(145, 240 - 15, "< >");
+    /* End Footer */
+
+    UG_FillFrame(0, 16, 320 - 1, 240 - 20, C_BLACK);
+
+    UG_SetForecolor(C_RED);
+    UG_SetBackcolor(C_BLACK);
+    UG_PutString(0, 240 - 30, "* restart required");
+    esp_app_desc_t *desc = esp_ota_get_app_description();
+    char idfVer[512];
+    sprintf(idfVer, "IDF %s", desc->idf_ver);
+    UG_SetForecolor(C_WHITE);
+    UG_SetBackcolor(C_BLACK);
+    UG_PutString(0, 240 - 72, desc->project_name);
+    UG_PutString(0, 240 - 58, desc->version);
+    UG_PutString(0, 240 - 44, idfVer);
+
+    for (int i = 0; i < num_menu; i++)
+    {
+        short top = 18 + i * 15 + 8;
+        if (i == selected)
+            UG_SetForecolor(C_YELLOW);
+        else
+            UG_SetForecolor(C_WHITE);
+
+        UG_PutString(0, top, menu_text[i]);
+
+        // show value on right side
+        switch (i)
+        {
+        case 0:
+            if (i == selected)
+                ui_display_switch(307, top, wifi_en, C_YELLOW, C_BLUE, C_GRAY);
+            else
+                ui_display_switch(307, top, wifi_en, C_WHITE, C_BLUE, C_GRAY);
+            break;
+        case 1:
+            if (i == selected)
+                ui_display_seekbar((320 - 103), top + 4, 100, (volume * 100) / 100, C_YELLOW, C_RED);
+            else
+                ui_display_seekbar((320 - 103), top + 4, 100, (volume * 100) / 100, C_WHITE, C_RED);
+            break;
+        case 2:
+            if (i == selected)
+                ui_display_seekbar((320 - 103), top + 4, 100, (bright * 100) / 100, C_YELLOW, C_RED);
+            else
+                ui_display_seekbar((320 - 103), top + 4, 100, (bright * 100) / 100, C_WHITE, C_RED);
+            break;
+        case 3:
+            UG_PutString(319 - (strlen(scaling_text[scaling]) * 9), top, scaling_text[scaling]);
+            break;
+
+        default:
+            break;
+        }
+    }
+    ui_flush();
+}
+
+static int showOption()
+{
+    int32_t wifi_state = wifi_en;
+    int selected = 0;
+    showOptionPage(selected);
+
+    input_gamepad_state prevKey;
+    gamepad_read(&prevKey);
+    while (true)
+    {
+        input_gamepad_state key;
+        gamepad_read(&key);
+        if (!prevKey.values[GAMEPAD_INPUT_DOWN] && key.values[GAMEPAD_INPUT_DOWN])
+        {
+            ++selected;
+            if (selected > num_menu - 1)
+                selected = 0;
+            showOptionPage(selected);
+        }
+        if (!prevKey.values[GAMEPAD_INPUT_UP] && key.values[GAMEPAD_INPUT_UP])
+        {
+            --selected;
+            if (selected < 0)
+                selected = num_menu - 1;
+            showOptionPage(selected);
+        }
+        if (!prevKey.values[GAMEPAD_INPUT_LEFT] && key.values[GAMEPAD_INPUT_LEFT])
+        {
+            switch (selected)
+            {
+            case 0:
+                wifi_en = ! wifi_en;
+                settings_save(SettingWifi, (int32_t)wifi_en);
+                break;
+            case 1:
+                volume -= 5;
+                if (volume < 0)
+                    volume = 0;
+                settings_save(SettingAudioVolume, (int32_t)volume);
+                break;
+            case 2:
+                bright -= 5;
+                if (bright < 1)
+                    bright = 1;
+                set_display_brightness(bright);
+                settings_save(SettingBacklight, (int32_t)bright);
+                break;
+            case 3:
+                scaling--;
+                if (scaling < 0)
+                    scaling = 2;
+                settings_save(SettingScaleMode, (int32_t)scaling);
+                break;
+
+            default:
+                break;
+            }
+            showOptionPage(selected);
+        }
+        if (!prevKey.values[GAMEPAD_INPUT_RIGHT] && key.values[GAMEPAD_INPUT_RIGHT])
+        {
+            switch (selected)
+            {
+            case 0:
+                wifi_en = !wifi_en;
+                settings_save(SettingWifi, (int32_t)wifi_en);
+                break;
+            case 1:
+                volume += 5;
+                if (volume > 100)
+                    volume = 100;
+                settings_save(SettingAudioVolume, (int32_t)volume);
+                break;
+            case 2:
+                bright += 5;
+                if (bright > 100)
+                    bright = 100;
+                set_display_brightness(bright);
+                settings_save(SettingBacklight, (int32_t)bright);
+                break;
+            case 3:
+                scaling++;
+                if (scaling > 2)
+                    scaling = 0;
+                settings_save(SettingScaleMode, (int32_t)scaling);
+                break;
+
+            default:
+                break;
+            }
+            showOptionPage(selected);
+        }
+        if (!prevKey.values[GAMEPAD_INPUT_A] && key.values[GAMEPAD_INPUT_A])
+            if (selected == 4)
+            {
+                vTaskDelay(10);
+                break;
+            }
+
+        prevKey = key;
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    if (wifi_en != wifi_state)
+        return 1;
+
+    return 0;
+}
+
 //----------------------------------------------------------------
 void app_main(void)
 {
-    FILE *fp;
-    char s[256];
+    settings_init();
+    esplay_system_init();
 
-    printf("esplay start.\n");
+    audio_init(44100);
+    audio_amp_disable();
 
-    nvs_flash_init();
-    system_init();
     gamepad_init();
-    audio_init(16000);
-
-    switch (esp_sleep_get_wakeup_cause())
-    {
-    case ESP_SLEEP_WAKEUP_EXT0:
-    {
-        printf("app_main: ESP_SLEEP_WAKEUP_EXT0 deep sleep wake\n");
-        break;
-    }
-
-    case ESP_SLEEP_WAKEUP_EXT1:
-    case ESP_SLEEP_WAKEUP_TIMER:
-    case ESP_SLEEP_WAKEUP_TOUCHPAD:
-    case ESP_SLEEP_WAKEUP_ULP:
-    case ESP_SLEEP_WAKEUP_UNDEFINED:
-    default:
-        printf("app_main: Not a deep sleep reset\n");
-        break;
-    }
+    event_init();
 
     // Display
     display_prepare();
     display_init();
 
-    set_display_brightness((int) get_backlight_settings());
+    int brightness = 50;
+    settings_load(SettingBacklight, &brightness);
+    set_display_brightness(brightness);
 
     battery_level_init();
 
-    display_show_splash();
-    vTaskDelay(200);
-
-    sdcard_open("/sd"); // map SD card.
-
-    display_clear(0); // clear screen
-    sprintf(s, "Volume: %i%%   ", get_volume_settings() * 25);
-    print(0, 0, s);
-    print(16, 0, "ESPLAY");
     battery_level_read(&bat_state);
-    sprintf(s, "Battery: %i%%", bat_state.percentage);
-    print(26, 0, s);
-
-    write_frame_rectangleLE((320 - main_title.width) / 2, 12, main_title.width, main_title.height, main_title.pixel_data);
-
-    read_config();
-
-    if (bat_state.percentage < 1)
+    if (bat_state.percentage == 0)
     {
         display_show_empty_battery();
-        vTaskDelay(500);
 
         printf("PowerDown: Powerdown LCD panel.\n");
         display_poweroff();
@@ -426,96 +425,211 @@ void app_main(void)
         abort();
     }
 
-    print_emulator(e, y);
+    if (esp_reset_reason() == ESP_RST_POWERON)
+        display_show_splash();
+
+    sdcard_open("/sd"); // map SD card.
+
+    ui_init();
+    charging_state st = getChargeStatus();
+    if (st == CHARGING)
+        handleCharging();
+
+    UG_FontSelect(&FONT_8X12);
+    if(settings_load(SettingWifi, &wifi_en) != 0)
+        settings_save(SettingWifi, (int32_t)wifi_en);
+    if(settings_load(SettingAudioVolume, &volume) != 0)
+        settings_save(SettingAudioVolume, (int32_t)volume);
+    if(settings_load(SettingBacklight, &bright) != 0)
+        settings_save(SettingBacklight, (int32_t)bright);
+    if(settings_load(SettingScaleMode, &scaling) != 0)
+        settings_save(SettingScaleMode, (int32_t)scaling);
+
+    if (wifi_en)
+    {
+        tcpip_adapter_init();
+        ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+        wifi_config_t ap_config = {
+            .ap = {
+                .ssid = "esplay",
+                .authmode = WIFI_AUTH_OPEN,
+                .max_connection = 2,
+                .beacon_interval = 200}};
+        uint8_t channel = 5;
+        ap_config.ap.channel = channel;
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+
+        ESP_ERROR_CHECK(esp_wifi_start());
+
+        /* Start the file server */
+        ESP_ERROR_CHECK(start_file_server("/sd"));
+
+        printf("\nReady, AP on channel %d\n", (int)channel);
+    }
+    else
+    {
+        printf("\nAP Disabled, enabled wifi to use File Manager\n");
+    }
+
+    drawHomeScreen();
+    int menuItem = 0;
+    int prevItem = 0;
+    int scroll = 0;
+    int doRefresh = 1;
+    int oldArrowsTick = -1;
+    int lastUpdate = 0;
+    charging_state chrg_st = getChargeStatus();
+    input_gamepad_state prevKey;
+    gamepad_read(&prevKey);
     while (1)
     {
+        input_gamepad_state joystick;
         gamepad_read(&joystick);
-        if (joystick.values[GAMEPAD_INPUT_LEFT])
+        if (!prevKey.values[GAMEPAD_INPUT_LEFT] && joystick.values[GAMEPAD_INPUT_LEFT] && !scroll)
         {
-            y = 0;
-            e--;
-            if (e < 0)
-                e = (num_emulators - 1) - 1;
-            print_emulator(e, y);
-            debounce(GAMEPAD_INPUT_LEFT);
+            menuItem++;
+            if (menuItem > NUM_EMULATOR - 1)
+                menuItem = 0;
+            scroll = -SCROLLSPD;
         }
-        if (joystick.values[GAMEPAD_INPUT_RIGHT])
+        if (!prevKey.values[GAMEPAD_INPUT_RIGHT] && joystick.values[GAMEPAD_INPUT_RIGHT] && !scroll)
         {
-            y = 0;
-            e++;
-            if (e == num_emulators - 1)
-                e = 0;
-            print_emulator(e, y);
-            debounce(GAMEPAD_INPUT_RIGHT);
+            menuItem--;
+            if (menuItem < 0)
+                menuItem = NUM_EMULATOR - 1;
+            scroll = SCROLLSPD;
         }
-        if (joystick.values[GAMEPAD_INPUT_UP])
+        if (scroll > 0)
+            scroll += SCROLLSPD;
+        if (scroll < 0)
+            scroll -= SCROLLSPD;
+        if (scroll > 320 || scroll < -320)
         {
-            y--;
-            if (y < 0)
-                y = count - 1;
-            print_emulator(e, y);
-            debounce(GAMEPAD_INPUT_UP);
+            prevItem = menuItem;
+            scroll = 0;
+            doRefresh = 1;
         }
-        if (joystick.values[GAMEPAD_INPUT_DOWN])
+        if (prevItem != menuItem)
+            renderGraphics(scroll, 78, 0, (56 * prevItem) + 24, 320, 56);
+        if (scroll)
         {
-            y++;
-            if (y >= count)
-                y = 0;
-            print_emulator(e, y);
-            debounce(GAMEPAD_INPUT_DOWN);
+            renderGraphics(scroll + ((scroll > 0) ? -320 : 320), 78, 0, (56 * menuItem) + 24, 320, 56);
+            doRefresh = 1;
+            lastUpdate = 0;
         }
-        if (joystick.values[GAMEPAD_INPUT_SELECT] && y > 9)
+        else
         {
-            y -= 10;
-            print_emulator(e, y);
-            debounce(GAMEPAD_INPUT_SELECT);
-        }
-        if (joystick.values[GAMEPAD_INPUT_START] && y < count - 10)
-        {
-            y += 10;
-            print_emulator(e, y);
-            debounce(GAMEPAD_INPUT_START);
-        }
-        if (joystick.values[GAMEPAD_INPUT_A])
-        {
-            if (count != 0)
+            int update = 1;
+            if (update != lastUpdate)
             {
-                if (e == 6)
+                if (menuItem < 6)
                 {
-                    set_volume_settings(y);
-                    sprintf(s, "Volume: %i%%   ", y * 25);
-                    print(0, 0, s);
-                    print(14, 15, "Saved....");
-                    vTaskDelay(20);
-                    print(14, 15, "         ");
-                }
-                else if (e == 7)
-                {
-                    set_backlight_settings((y + 1) * 10);
-                    set_display_brightness((y + 1) * 10);
-                    print(14, 15, "Saved....");
-                    vTaskDelay(20);
-                    print(14, 15, "         ");
-                }
-                else if (e == 8)
-                {
-                    set_scale_option_settings(y);
-                    print(14, 15, "Saved....");
-                    vTaskDelay(20);
-                    print(14, 15, "         ");
+                    char *path = malloc(strlen(base_path) + strlen(emu_dir[menuItem]) + 1);
+                    strcpy(path, base_path);
+                    strcat(path, emu_dir[menuItem]);
+                    int count = sdcard_get_files_count(path);
+                    char text[320];
+                    sprintf(text, "%i games available", count);
+                    UG_FillFrame(0, 64, 319, 76, C_BLACK);
+                    UG_PutString((320 / 2) - (strlen(text) * 9 / 2), 64, text);
+                    renderGraphics(0, 78, 0, (56 * menuItem) + 24, 320, 56);
                 }
                 else
                 {
-                    // not in an empty directory...
-                    set_rom_name_settings(target);
-                    print(14, 15, "Loading....");
-                    system_application_set(emu_slot[e]); // set emulator slot
-                    esp_restart();                       // reboot!
+                    UG_FillFrame(0, 64, 319, 76, C_BLACK);
+                    renderGraphics(0, 78, 0, (56 * menuItem) + 24, 320, 56);
                 }
+
+                    lastUpdate = update;
+
             }
-            debounce(GAMEPAD_INPUT_A);
+            //Render arrows
+            int t = xTaskGetTickCount() / (400 / portTICK_PERIOD_MS);
+            t = (t & 1);
+            if (t != oldArrowsTick)
+            {
+                doRefresh = 1;
+                renderGraphics(10, 90, t ? 0 : 32, 416, 32, 23);
+                renderGraphics(276, 90, t ? 64 : 96, 416, 32, 23);
+                oldArrowsTick = t;
+            }
         }
-        if (joystick.values[GAMEPAD_INPUT_B])
+        if (!prevKey.values[GAMEPAD_INPUT_A] && joystick.values[GAMEPAD_INPUT_A])
+        {
+            if (menuItem < 6)
+            {
+                char ext[4];
+                strcpy(ext, ".");
+                strcat(ext, emu_dir[menuItem]);
+
+                char *path = malloc(strlen(base_path) + strlen(emu_dir[menuItem]) + 1);
+                strcpy(path, base_path);
+                strcat(path, emu_dir[menuItem]);
+                char *filename = ui_file_chooser(path, ext, 0, emu_name[menuItem]);
+                if (filename)
+                {
+                    settings_save_str(SettingRomPath, filename);
+                    system_application_set(emu_slot[menuItem]);
+                    ui_clear_screen();
+                    ui_flush();
+                    display_show_hourglass();
+                    esp_restart();
+                }
+                free(path);
+            }
+            else
+            {
+                Entry *new_entries;
+
+                int n_entries = fops_list_dir(&new_entries, AUDIO_FILE_PATH);
+                audio_player((AudioPlayerParam){new_entries, n_entries, 0, AUDIO_FILE_PATH, true});
+
+                fops_free_entries(&new_entries, n_entries);
+                // TODO : For some reason after audio_player close it won't play anymore so just restart for now
+                esp_restart();
+                /*
+                drawHomeScreen();
+                lastUpdate = 0;
+                doRefresh = 1;
+                */
+            }
+
+            // B Pressed instead of A
+            drawHomeScreen();
+            lastUpdate = 0;
+            doRefresh = 1;
+        }
+        if (!prevKey.values[GAMEPAD_INPUT_B] && joystick.values[GAMEPAD_INPUT_B])
             resume();
+
+        if (!prevKey.values[GAMEPAD_INPUT_MENU] && joystick.values[GAMEPAD_INPUT_MENU])
+        {
+            int r = showOption();
+            if (r)
+                esp_restart();
+
+            drawHomeScreen();
+            lastUpdate = 0;
+            doRefresh = 1;
+        }
+
+        if (getChargeStatus() != chrg_st)
+        {
+            battery_level_read(&bat_state);
+            drawBattery(bat_state.percentage);
+            doRefresh = 1;
+            chrg_st = getChargeStatus();
+        }
+
+        if (doRefresh)
+            ui_flush();
+
+        doRefresh = 0;
+        prevKey = joystick;
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }

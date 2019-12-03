@@ -9,6 +9,7 @@
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "esp_ota_ops.h"
+#include <limits.h>
 
 #include "../components/smsplus/shared.h"
 
@@ -20,6 +21,8 @@
 #include "sdcard.h"
 #include "power.h"
 #include "display_sms.h"
+#include "menu.h"
+#include "gb_frame.h"
 
 #include <dirent.h>
 
@@ -33,21 +36,25 @@ int currentFramebuffer = 0;
 
 uint32_t *audioBuffer = NULL;
 int audioBufferCount = 0;
+int showOverlay = 0;
 
 spi_flash_mmap_handle_t hrom;
 
 QueueHandle_t vidQueue;
 TaskHandle_t videoTaskHandle;
 
-esplay_volume_level Volume;
+int Volume;
 battery_state battery;
+
+static void LoadState(const char* filename);
+static void SaveState();
 
 volatile bool videoTaskIsRunning = false;
 esplay_scale_option opt;
 void videoTask(void *arg)
 {
     uint8_t *param;
-    opt = get_scale_option_settings();
+    settings_load(SettingScaleMode, &opt);
     videoTaskIsRunning = true;
 
     const bool isGameGear = (sms.console == CONSOLE_GG) | (sms.console == CONSOLE_GGMS);
@@ -59,8 +66,55 @@ void videoTask(void *arg)
         if (param == 1)
             break;
 
-        render_copy_palette(palette);
-        write_sms_frame(param, palette, isGameGear, opt);
+        if (param == 2)
+        {
+            render_copy_palette(palette);
+            //write_frame_rectangleLE(32,0,256,240,NULL);
+            int ret = showMenu();
+            char *cartName = settings_load_str(SettingRomPath);
+            switch (ret)
+            {
+            case MENU_SAVE_STATE:
+                display_show_hourglass();
+                SaveState();
+                break;
+
+            case MENU_LOAD:
+                display_show_hourglass();
+                LoadState(cartName);
+                break;
+
+            case MENU_SAVE_EXIT:
+                display_show_hourglass();
+                SaveState();
+                system_application_set(0);
+                esp_restart();
+                break;
+
+            case MENU_EXIT:
+                display_show_hourglass();
+                system_application_set(0);
+                esp_restart();
+                break;
+
+            case MENU_RESET:
+                system_reset();
+                break;
+
+            default:
+                break;
+            }
+
+            free(cartName);
+            write_sms_frame(NULL, palette, isGameGear, opt);
+            showOverlay = 0;
+            vTaskDelay(10);
+        }
+        else
+        {
+            render_copy_palette(palette);
+            write_sms_frame(param, palette, isGameGear, opt);
+        }
 
         battery_level_read(&battery);
 
@@ -106,7 +160,8 @@ const char *StoragePath = "/storage";
 
 static void SaveState()
 {
-    char *romName = get_rom_name_settings();
+    char *romName = settings_load_str(SettingRomPath);
+
     if (romName)
     {
         char *fileName = system_util_GetFileName(romName);
@@ -154,7 +209,8 @@ static void SaveState()
 
 static void LoadState(const char *cartName)
 {
-    char *romName = get_rom_name_settings();
+    char * romName = settings_load_str(SettingRomPath);
+
     if (romName)
     {
         char *fileName = system_util_GetFileName(romName);
@@ -198,7 +254,7 @@ static void LoadState(const char *cartName)
         }
     }
 
-    Volume = get_volume_settings();
+    settings_load(SettingAudioVolume, &Volume);
     audio_volume_set(Volume);
 }
 
@@ -283,9 +339,9 @@ void app_main(void)
         abort();
     printf("app_main: framebuffer[1]=%p\n", framebuffer[1]);
 
-    nvs_flash_init();
+    settings_init();
 
-    system_init();
+    esplay_system_init();
 
     // Joystick.
     gamepad_init();
@@ -346,15 +402,18 @@ void app_main(void)
     }
 
     display_init();
-    set_display_brightness((int) get_backlight_settings());
+    int brightness;
+    settings_load(SettingBacklight, &brightness);
+    set_display_brightness(brightness);
 
     const char *FILENAME = NULL;
 
-    char *cartName = get_rom_name_settings();
+    char *cartName = settings_load_str(SettingRomPath);
+
     if (!cartName)
     {
         // Load fixed file name
-        FILENAME = "/sd/default.sms";
+        FILENAME = "/sd/roms/gg/test.gg";
     }
     else
     {
@@ -373,6 +432,10 @@ void app_main(void)
     load_rom(FILENAME);
 
     write_sms_frame(NULL, NULL, false, SCALE_STRETCH);
+
+    // draw frame
+    //renderGfx(0,0,32,240,gb_frame.pixel_data,0,0,gb_frame.width);
+    //renderGfx(32+256,0,32,240,gb_frame.pixel_data,32,0,gb_frame.width);
 
     vidQueue = xQueueCreate(1, sizeof(uint16_t *));
     xTaskCreatePinnedToCore(&videoTask, "videoTask", 1024 * 4, NULL, 5, &videoTaskHandle, 1);
@@ -445,7 +508,16 @@ void app_main(void)
 
         if (!ignoreMenuButton && previousState.values[GAMEPAD_INPUT_MENU] && !joystick.values[GAMEPAD_INPUT_MENU])
         {
-            DoHome();
+            //DoHome();
+            showOverlay = 1;
+
+            uint16_t *param = 2;
+            xQueueSend(vidQueue, &param, portMAX_DELAY);
+        }
+
+        while (showOverlay)
+        {
+            vTaskDelay(10);
         }
 
         startTime = xthal_get_ccount();

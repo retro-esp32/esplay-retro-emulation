@@ -15,7 +15,9 @@
 #include "driver/rtc_io.h"
 #include "esp_partition.h"
 #include "esp_ota_ops.h"
+#include "esp_task_wdt.h"
 
+#include <limits.h>
 #include <loader.h>
 #include <hw.h>
 #include <lcd.h>
@@ -37,9 +39,12 @@
 #include <settings.h>
 #include <power.h>
 #include "display_gb.h"
+#include "menu.h"
+#include "gb_frame.h"
 
 extern int debug_trace;
 
+int showOverlay = 0;
 struct fb fb;
 struct pcm pcm;
 
@@ -63,6 +68,11 @@ const char *SD_BASE_PATH = "/sd";
 #define GAMEBOY_HEIGHT (144)
 
 #define AUDIO_SAMPLE_RATE (32000)
+
+static void DoMenuHome();
+static void SaveState();
+static void LoadState();
+static void PowerDown();
 
 // --- MAIN
 QueueHandle_t vidQueue;
@@ -146,18 +156,71 @@ esplay_scale_option scale_opt;
 void videoTask(void *arg)
 {
     esp_err_t ret;
-    scale_opt = get_scale_option_settings();
+    settings_load(SettingScaleMode, &scale_opt);
     videoTaskIsRunning = true;
 
     uint16_t *param;
     while (1)
     {
+        esp_task_wdt_feed();
         xQueuePeek(vidQueue, &param, portMAX_DELAY);
 
         if (param == 1)
             break;
 
-        write_gb_frame(param, scale_opt);
+        if (param == 2)
+        {
+            for (int i=0; i<160*144; i++) {
+                int r,g,b;
+                r=((framebuffer[i]>>11)&0x1f)<<3;
+                g=((framebuffer[i]>>5)&0x3f)<<2;
+                b=((framebuffer[i]>>0)&0x1f)<<3;
+                uint16_t a = 200;
+                r=r*(256-a);
+                g=g*(256-a);
+                b=b*(256-a);
+                framebuffer[i]=((r>>(3+8))<<11)+((g>>(2+8))<<5)+((b>>(3+8))<<0);
+            }
+            write_gb_frame(framebuffer, scale_opt);
+            int ret = showMenu();
+            switch (ret)
+            {
+            case MENU_SAVE_STATE:
+                display_show_hourglass();
+                SaveState();
+                break;
+
+            case MENU_LOAD:
+                display_show_hourglass();
+                LoadState();
+                break;
+
+            case MENU_SAVE_EXIT:
+                display_show_hourglass();
+                SaveState();
+                system_application_set(0);
+                esp_restart();
+                break;
+
+            case MENU_RESET:
+                emu_reset();
+                break;
+
+            case MENU_EXIT:
+                display_show_hourglass();
+                system_application_set(0);
+                esp_restart();
+                break;
+
+            default:
+                break;
+            }
+            write_gb_frame(NULL, scale_opt);
+            showOverlay = 0;
+            vTaskDelay(10);
+        }
+        else
+            write_gb_frame(param, scale_opt);
 
         xQueueReceive(vidQueue, &param, portMAX_DELAY);
     }
@@ -213,7 +276,8 @@ void audioTask(void *arg)
 static void SaveState()
 {
     // Save sram
-    char *romPath = get_rom_name_settings();
+    char *romPath = settings_load_str(SettingRomPath);
+
     if (romPath)
     {
         char *fileName = system_util_GetFileName(romPath);
@@ -259,7 +323,7 @@ static void SaveState()
 
 static void LoadState(const char *cartName)
 {
-    char *romName = get_rom_name_settings();
+    char *romName = settings_load_str(SettingRomPath);
     if (romName)
     {
         char *fileName = system_util_GetFileName(romName);
@@ -385,9 +449,9 @@ void app_main(void)
 {
     printf("gnuboy (%s-%s).\n", COMPILEDATE, GITREV);
 
-    nvs_flash_init();
+    settings_init();
 
-    system_init();
+    esplay_system_init();
 
     // Audio
     audio_init(AUDIO_SAMPLE_RATE);
@@ -397,11 +461,17 @@ void app_main(void)
     display_init();
 
     // set brightness
-    set_display_brightness(get_backlight_settings());
-    audio_volume_set(get_volume_settings());
+    int brightness = 50;
+    settings_load(SettingBacklight, &brightness);
+    set_display_brightness(brightness);
 
-    //display_show_splash();
-    //vTaskDelay(2000);
+    // volume
+    int volume = 25;
+    settings_load(SettingAudioVolume, &volume);
+    audio_volume_set(volume);
+
+    // battery
+    battery_level_init();
 
     // Gamepad
     gamepad_init();
@@ -412,50 +482,54 @@ void app_main(void)
 
     switch (esp_sleep_get_wakeup_cause())
     {
-        case ESP_SLEEP_WAKEUP_EXT0:
+    case ESP_SLEEP_WAKEUP_EXT0:
+    {
+        printf("app_main: ESP_SLEEP_WAKEUP_EXT0 deep sleep wake\n");
+        break;
+    }
+
+    case ESP_SLEEP_WAKEUP_EXT1:
+    case ESP_SLEEP_WAKEUP_TIMER:
+    case ESP_SLEEP_WAKEUP_TOUCHPAD:
+    case ESP_SLEEP_WAKEUP_ULP:
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+    {
+        printf("app_main: Non deep sleep startup\n");
+
+        input_gamepad_state bootState = gamepad_input_read_raw();
+
+        if (bootState.values[GAMEPAD_INPUT_MENU])
         {
-            printf("app_main: ESP_SLEEP_WAKEUP_EXT0 deep sleep wake\n");
-            break;
+            // Force return to factory app to recover from
+            // ROM loading crashes
+
+            // Set menu application
+            system_application_set(0);
+
+            // Reset
+            esp_restart();
         }
 
-        case ESP_SLEEP_WAKEUP_EXT1:
-        case ESP_SLEEP_WAKEUP_TIMER:
-        case ESP_SLEEP_WAKEUP_TOUCHPAD:
-        case ESP_SLEEP_WAKEUP_ULP:
-        case ESP_SLEEP_WAKEUP_UNDEFINED:
+        if (bootState.values[GAMEPAD_INPUT_START])
         {
-            printf("app_main: Non deep sleep startup\n");
-
-            input_gamepad_state bootState = gamepad_input_read_raw();
-
-            if (bootState.values[GAMEPAD_INPUT_MENU])
-            {
-                // Force return to factory app to recover from
-                // ROM loading crashes
-
-                // Set menu application
-                system_application_set(0);
-
-                // Reset
-                esp_restart();
-            }
-
-            if (bootState.values[GAMEPAD_INPUT_START])
-            {
-                // Reset emulator if button held at startup to
-                // override save state
-                forceConsoleReset = true;
-            }
-
-            break;
+            // Reset emulator if button held at startup to
+            // override save state
+            forceConsoleReset = true;
         }
-        default:
-            printf("app_main: Not a deep sleep reset\n");
-            break;
+
+        break;
+    }
+    default:
+        printf("app_main: Not a deep sleep reset\n");
+        break;
     }
 
     // Clear display
     write_gb_frame(NULL, SCALE_STRETCH);
+
+    // draw frame
+    //renderGfx(0,0,32,240,gb_frame.pixel_data,0,0,gb_frame.width);
+    //renderGfx(32+256,0,32,240,gb_frame.pixel_data,32,0,gb_frame.width);
 
     // Load ROM
     loader_init(NULL);
@@ -480,7 +554,7 @@ void app_main(void)
     vidQueue = xQueueCreate(1, sizeof(uint16_t *));
     audioQueue = xQueueCreate(1, sizeof(uint16_t *));
 
-    xTaskCreatePinnedToCore(&videoTask, "videoTask", 2048, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(&videoTask, "videoTask", 1024 * 3, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(&audioTask, "audioTask", 2048, NULL, 5, NULL, 1); //768
 
     //debug_trace = 1;
@@ -565,18 +639,22 @@ void app_main(void)
             menuButtonFrameCount = 0;
         }
 
-        //if (!lastJoysticState.Menu && joystick.Menu)
         if (menuButtonFrameCount > 60 * 2)
         {
             PowerDown();
-            //DoMenuHome();
         }
 
         if (!ignoreMenuButton && lastJoysticState.values[GAMEPAD_INPUT_MENU] && !joystick.values[GAMEPAD_INPUT_MENU])
         {
-            // Save State and Go To Menu
-            //PowerDown();
-            DoMenuHome();
+            showOverlay = 1;
+            uint16_t *param = 2;
+            xQueueSend(vidQueue, &param, portMAX_DELAY);
+            lastJoysticState = joystick;
+        }
+
+        while (showOverlay)
+        {
+            vTaskDelay(10);
         }
 
         pad_set(PAD_UP, joystick.values[GAMEPAD_INPUT_UP]);
