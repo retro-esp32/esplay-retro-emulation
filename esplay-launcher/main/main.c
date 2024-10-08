@@ -39,13 +39,15 @@ char emu_name[6][20] = {"Nintendo", "Gameboy", "Gameboy Color", "Sega Master Sys
 int emu_slot[6] = {1, 2, 2, 3, 3, 3};
 char *base_path = "/sd/roms/";
 battery_state bat_state;
-int num_menu = 5;
-char menu_text[5][20] = {"WiFi AP *", "Volume", "Brightness", "Upscaler", "Quit"};
+int num_menu = 6;
+char menu_text[6][20] = {"WiFi AP *", "Volume", "Brightness", "Upscaler", "Scale Alg", "Quit"};
 char scaling_text[3][20] = {"Native", "Normal", "Stretch"};
+char scaling_alg_text[3][20] = {"Nearest Neighbor", "Bilinier Intrp.", "Box Filtered"};
 int32_t wifi_en = 0;
 int32_t volume = 25;
 int32_t bright = 50;
 int32_t scaling = SCALE_FIT;
+int32_t scale_alg = NEAREST_NEIGHBOR;
 
 
 esp_err_t start_file_server(const char *base_path);
@@ -69,7 +71,7 @@ static void handleCharging() {
 	guiCharging(0);
 
 	//Speed down
-	rtc_clk_cpu_freq_set(RTC_CPU_FREQ_80M);
+	rtc_clk_cpu_freq_set(RTC_CPU_FREQ_2M);
     input_gamepad_state prevKey;
     gamepad_read(&prevKey);
 	do {
@@ -272,6 +274,10 @@ static void showOptionPage(int selected)
             UG_PutString(319 - (strlen(scaling_text[scaling]) * 9), top, scaling_text[scaling]);
             break;
 
+        case 4:
+            UG_PutString(319 - (strlen(scaling_alg_text[scale_alg]) * 9), top, scaling_alg_text[scale_alg]);
+            break;
+
         default:
             break;
         }
@@ -332,6 +338,12 @@ static int showOption()
                     scaling = 2;
                 settings_save(SettingScaleMode, (int32_t)scaling);
                 break;
+            case 4:
+                scale_alg--;
+                if (scale_alg < 0)
+                    scale_alg = 1;
+                settings_save(SettingAlg, (int32_t)scale_alg);
+                break;
 
             default:
                 break;
@@ -365,6 +377,12 @@ static int showOption()
                     scaling = 0;
                 settings_save(SettingScaleMode, (int32_t)scaling);
                 break;
+            case 4:
+                scale_alg++;
+                if (scale_alg > 1)
+                    scale_alg = 0;
+                settings_save(SettingAlg, (int32_t)scale_alg);
+                break;
 
             default:
                 break;
@@ -372,7 +390,7 @@ static int showOption()
             showOptionPage(selected);
         }
         if (!prevKey.values[GAMEPAD_INPUT_A] && key.values[GAMEPAD_INPUT_A])
-            if (selected == 4)
+            if (selected == 5)
             {
                 vTaskDelay(10);
                 break;
@@ -398,7 +416,6 @@ void app_main(void)
     audio_amp_disable();
 
     gamepad_init();
-    event_init();
 
     // Display
     display_prepare();
@@ -444,6 +461,8 @@ void app_main(void)
         settings_save(SettingBacklight, (int32_t)bright);
     if(settings_load(SettingScaleMode, &scaling) != 0)
         settings_save(SettingScaleMode, (int32_t)scaling);
+    if(settings_load(SettingAlg, &scale_alg) != 0)
+        settings_save(SettingAlg, (int32_t)scale_alg);
 
     if (wifi_en)
     {
@@ -589,13 +608,11 @@ void app_main(void)
                 audio_player((AudioPlayerParam){new_entries, n_entries, 0, AUDIO_FILE_PATH, true});
 
                 fops_free_entries(&new_entries, n_entries);
-                // TODO : For some reason after audio_player close it won't play anymore so just restart for now
-                esp_restart();
-                /*
+
+                UG_FontSelect(&FONT_8X12);
                 drawHomeScreen();
                 lastUpdate = 0;
                 doRefresh = 1;
-                */
             }
 
             // B Pressed instead of A

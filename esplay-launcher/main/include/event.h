@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <gamepad.h>
 
 typedef enum {
 	/// Event to react to keypad presses
@@ -19,9 +20,8 @@ typedef struct {
 
 typedef struct {
 	event_head_t head;
-	uint16_t state;
-	uint16_t pressed;
-	uint16_t released;
+	input_gamepad_state state;
+	input_gamepad_state last_state;
 } event_keypad_t;
 
 typedef enum AudioPlayerEvent {
@@ -42,5 +42,6 @@ typedef union {
 } event_t;
 
 void event_init(void);
+void event_deinit(void);
 int wait_event(event_t *event);
 int push_event(event_t *event);

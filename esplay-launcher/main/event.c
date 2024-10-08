@@ -4,53 +4,45 @@
 
 #include <event.h>
 #include <gamepad.h>
-
-#define REPEAT_HOLDOFF (250 / portTICK_PERIOD_MS)
-#define REPEAT_RATE (80 / portTICK_PERIOD_MS)
+#include <string.h>
 
 static QueueHandle_t event_queue;
+static bool event_running = false;
 
 static void keypad_task(void *arg)
 {
+	event_running = true;
 	event_t event;
-	uint16_t changes;
-
-	TickType_t down_ticks[4];
-	uint16_t repeat_count[4];
-
-	while (true) {
+	input_gamepad_state prevKey;
+	gamepad_read(&prevKey);
+	while (event_running) {
+		input_gamepad_state key;
+		gamepad_read(&key);
 		vTaskDelay(10 / portTICK_PERIOD_MS);
 		event.type = EVENT_TYPE_KEYPAD;
-		event.keypad.state = keypad_debounce(keypad_sample(), &changes);
-		event.keypad.pressed = event.keypad.state & changes;
-		event.keypad.released = ~event.keypad.state & changes;
+		event.keypad.state = key;
+		event.keypad.last_state = prevKey;
 
-		TickType_t now = xTaskGetTickCount();
-		for (int i = 0; i < 4; i++) {
-			if ((event.keypad.pressed >> i) & 1) {
-				down_ticks[i] = now;
-				repeat_count[i] = UINT16_MAX;
-			} else if ((event.keypad.state >> i) & 1) {
-				if (now - down_ticks[i] >= REPEAT_HOLDOFF) {
-					uint16_t n = (now - down_ticks[i] - REPEAT_HOLDOFF) / REPEAT_RATE;
-					if (repeat_count[i] != n) {
-						repeat_count[i] = n;
-						event.keypad.pressed |= (1 << i);
-					}
-				}
-			}
-		}
-
-		if (event.keypad.pressed || event.keypad.released) {
+		if (memcmp(prevKey.values, key.values, sizeof(prevKey)) != 0) {
 			push_event(&event);
 		}
+		prevKey = key;
 	}
+
+  vTaskDelete(NULL);
+	vQueueDelete(event_queue);
 }
 
 void event_init(void)
 {
 	event_queue = xQueueCreate(10, sizeof(event_t));
 	xTaskCreate(keypad_task, "keypad", 4096, NULL, 5, NULL);
+}
+
+void event_deinit(void)
+{
+	event_running = false;
+	printf("Shutdown event..\n");
 }
 
 int wait_event(event_t *event)
